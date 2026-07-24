@@ -156,15 +156,20 @@ TOOL_HANDLERS = {
 #  NEW in s04: Hook System (s03 permission logic now via hooks)
 # ═══════════════════════════════════════════════════════════
 
+# Hook 注册表：事件名 → 回调函数列表。同一生命周期节点可以挂多个扩展。
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 
 def register_hook(event: str, callback):
+    # 保存函数对象，注册时不执行；等对应事件发生时再由 trigger_hooks 调用。
     HOOKS[event].append(callback)
 
 def trigger_hooks(event: str, *args):
+    # 按注册顺序同步执行。同一个 *args 会原样传给该事件的所有回调。
     for callback in HOOKS[event]:
         result = callback(*args)
-        if result is not None:  # teaching shortcut: block this tool call
+        # 教学版用非 None 表示“接管控制”：PreToolUse 中代表阻止工具，
+        # Stop 中代表向 messages 注入新提示并让 Agent Loop 继续。
+        if result is not None:
             return result
     return None
 
@@ -195,6 +200,7 @@ def permission_hook(block):
             choice = input("   Allow? [y/N] ").strip().lower()
             if choice not in ("y", "yes"):
                 return "Permission denied by user"
+    # None 表示本 Hook 不阻止本次工具调用，继续运行后续 Hook。
     return None
 
 def log_hook(block):
@@ -222,8 +228,10 @@ def summary_hook(messages: list):
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
 
+# Hook 与 Agent Loop 解耦：新增扩展只需注册回调，不必修改循环主体。
 register_hook("UserPromptSubmit", context_inject_hook)
 register_hook("PreToolUse", permission_hook)
+# 注册顺序有意义：permission_hook 若返回拒绝原因，log_hook 将不会再执行。
 register_hook("PreToolUse", log_hook)
 register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
@@ -244,6 +252,7 @@ def agent_loop(messages: list):
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason != "tool_use":
+            # 模型准备结束时触发 Stop Hook；Hook 可返回新提示，要求循环继续。
             force = trigger_hooks("Stop", messages)
             if force:
                 messages.append({"role": "user", "content": force})
@@ -255,9 +264,10 @@ def agent_loop(messages: list):
             if block.type != "tool_use":
                 continue
 
-            # s04 change: hook replaces hard-coded check_permission()
+            # 工具真正执行前统一触发 PreToolUse；权限、日志等逻辑都挂在这里。
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
+                # 即使被 Hook 阻止，也要返回匹配 tool_use_id 的结果给模型。
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": str(blocked)})
                 continue
@@ -265,7 +275,8 @@ def agent_loop(messages: list):
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
 
-            trigger_hooks("PostToolUse", block, output)  # s04: post hook
+            # 工具执行成功后触发 PostToolUse，可用于审计、统计或检查输出。
+            trigger_hooks("PostToolUse", block, output)
 
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
 
@@ -284,6 +295,7 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        # 用户输入进入对话历史、发送给模型之前的扩展点。
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)

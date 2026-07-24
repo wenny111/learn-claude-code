@@ -162,7 +162,7 @@ def agent_loop(messages: list):
         for block in response.content:
             if block.type == "tool_use":
                 print(f"\033[33m> {block.name}\033[0m")
-                handler = TOOL_HANDLERS.get(block.name)
+                handler = TOOL_HANDLERS.get(block.name) # s01 中是硬编码 run_bash，现在改为查表
                 output = handler(**block.input) if handler else f"Unknown: {block.name}"
                 print(str(output)[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
