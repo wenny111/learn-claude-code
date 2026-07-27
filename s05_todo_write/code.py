@@ -47,6 +47,8 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+# 会话内的计划状态：todo_write 每次都会用完整的新列表覆盖它。
+# 它只用于展示进度，不会执行任务，也不会持久化到磁盘。
 CURRENT_TODOS: list[dict] = []
 
 # s05 change: SYSTEM prompt adds planning guidance
@@ -122,6 +124,8 @@ def run_glob(pattern: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 def _normalize_todos(todos):
+    # 工具参数属于执行边界。即使 TOOLS 中已有 JSON Schema，
+    # handler 仍需自行校验，不能假设模型生成的参数一定合法。
     if isinstance(todos, str):
         try:
             todos = json.loads(todos)
@@ -146,6 +150,7 @@ def run_todo_write(todos: list) -> str:
     todos, error = _normalize_todos(todos)
     if error:
         return error
+    # todo_write 采用“整表快照”语义，而不是只更新其中一项。
     CURRENT_TODOS = todos
     lines = ["\n\033[33m## Current Tasks\033[0m"]
     for t in CURRENT_TODOS:
@@ -165,7 +170,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
-    # s05: new tool
+    # s05: 新增 new tool 
     {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
      "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
 ]
@@ -232,12 +237,15 @@ register_hook("Stop", summary_hook)
 #  agent_loop — same as s04 + nag reminder counter
 # ═══════════════════════════════════════════════════════════
 
+# 统计连续多少个“模型工具调用轮次”没有更新 TODO。
+# 它统计的不是单个工具数量：同一轮调用多个工具也只加 1。
 rounds_since_todo = 0
 
 def agent_loop(messages: list):
     global rounds_since_todo
     while True:
-        # s05: nag reminder — inject if model hasn't updated todos for 3 rounds
+        # 在下一次请求模型前注入提醒，让它成为模型可见的上下文；
+        # 注入后立即清零，避免此后每一轮都重复提醒。
         if rounds_since_todo >= 3 and messages:
             messages.append({"role": "user",
                              "content": "<reminder>Update your todos.</reminder>"})
@@ -256,6 +264,8 @@ def agent_loop(messages: list):
                 continue
             return
 
+        # 能走到这里，说明本轮响应包含一个或多个 tool_use。
+        # 无论其中有几个工具，这都只算一个模型工具调用轮次。
         rounds_since_todo += 1
         results = []
         for block in response.content:
@@ -273,7 +283,8 @@ def agent_loop(messages: list):
 
             trigger_hooks("PostToolUse", block, output)
 
-            # s05: reset nag counter when todo_write is called
+            # 如果本轮包含 todo_write，说明计划已更新：抵消上面的
+            # 轮次累加，从最新一次 TODO 更新后重新计数。
             if block.name == "todo_write":
                 rounds_since_todo = 0
 

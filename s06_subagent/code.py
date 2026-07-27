@@ -54,7 +54,8 @@ SYSTEM = (
     "For complex sub-problems, use the task tool to spawn a subagent."
 )
 
-# s06: subagent gets its own system prompt — no task, no recursion
+# 子 Agent 有独立职责：只完成收到的单个子问题，再返回结论。
+# 提示词负责行为引导；下方不提供 task 工具才是禁止递归的硬边界。
 SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
     "Complete the task you were given, then return a concise summary. "
@@ -177,6 +178,8 @@ TOOL_HANDLERS = {
 
 # ═══════════════════════════════════════════════════════════
 #  NEW in s06: Subagent — fresh messages[], summary only
+#  只给完成子任务所需的基础工具；故意不包含 task/todo_write，
+#  避免任务树递归膨胀，也让父 Agent 保留任务分解与进度管理权。
 # ═══════════════════════════════════════════════════════════
 
 SUB_TOOLS = [
@@ -191,7 +194,8 @@ SUB_TOOLS = [
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
 ]
-# NO "task" tool — prevent recursive spawning
+# SUB_HANDLERS 与 SUB_TOOLS 保持同一能力边界：子 Agent 即使尝试
+# 生成 task 调用，也没有可分发的 handler。
 
 SUB_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
@@ -199,28 +203,34 @@ SUB_HANDLERS = {
 }
 
 def extract_text(content) -> str:
-    """Extract text from message content blocks."""
+    """只抽取最终文本，作为子 Agent 传回父 Agent 的压缩结果。"""
     if not isinstance(content, list):
         return str(content)
     return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
 
 def spawn_subagent(description: str) -> str:
-    """Spawn a subagent with fresh messages[], return summary only."""
+    """运行独立子循环；丢弃其过程上下文，只把总结交给父 Agent。"""
     print(f"\n\033[35m[Subagent spawned]\033[0m")
-    messages = [{"role": "user", "content": description}]  # fresh context
+    # 不复制父 Agent 的 messages：子 Agent 只知道任务描述，避免父对话的
+    # 探索过程占用它的上下文。两者仍共享 WORKDIR，因此文件副作用可见。
+    messages = [{"role": "user", "content": description}]
 
-    for _ in range(30):  # safety limit
+    # 给同步子循环设上限，防止重复工具调用无限消耗时间和 token。
+    # 一次迭代是一轮模型响应，不等于一次工具调用；一轮可含多个工具。
+    for _ in range(30):
         response = client.messages.create(
             model=MODEL, system=SUB_SYSTEM,
             messages=messages, tools=SUB_TOOLS, max_tokens=8000,
         )
+        # 过程消息仅保存在子 Agent 自己的上下文中，不写入父 Agent history。
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
+            # 模型已经给出最终回答，提前结束，无需用完 30 轮预算。
             break
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                # Issue 1: subagent also runs hooks (permissions apply)
+                # 上下文隔离不等于权限隔离：子 Agent 仍复用同一套 hooks。
                 blocked = trigger_hooks("PreToolUse", block)
                 if blocked:
                     results.append({"type": "tool_result", "tool_use_id": block.id,
@@ -232,9 +242,11 @@ def spawn_subagent(description: str) -> str:
                 print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": output})
+        # 工具输出只反馈给子 Agent，以便它继续完成自己的子任务。
         messages.append({"role": "user", "content": results})
 
-    # Issue 5: fallback if safety limit hit during tool_use
+    # 若用尽预算时最后一条是 tool_result，回看最近的 assistant 文本；
+    # 这样父 Agent 至少能得到部分结论或明确的失败信号。
     result = extract_text(messages[-1]["content"])
     if not result:
         # last message is tool_result, look backwards for assistant text
@@ -246,9 +258,10 @@ def spawn_subagent(description: str) -> str:
         if not result:
             result = "Subagent stopped after 30 turns without final answer."
     print(f"\033[35m[Subagent done]\033[0m")
-    return result  # only summary, entire message history discarded
+    # 这是上下文隔离的出口：父 Agent 只接收结论，不接收完整轨迹。
+    return result
 
-# Add task tool to parent's tools
+# task 只追加到父 Agent 的工具池；子 Agent 使用的 SUB_TOOLS 没有它。
 TOOLS.append({
     "name": "task",
     "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",

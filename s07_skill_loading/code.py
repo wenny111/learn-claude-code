@@ -44,6 +44,8 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
+# 技能文档不直接塞进对话；Harness 先发现目录和简介，
+# 模型真正需要时才通过 load_skill 取回完整说明。
 SKILLS_DIR = WORKDIR / "skills"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
@@ -51,7 +53,7 @@ CURRENT_TODOS: list[dict] = []
 
 # s07: Skill catalog scan (used by build_system below)
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
+    """解析 SKILL.md 的 YAML 元数据，用于构建目录。"""
     if not text.startswith("---"):
         return {}, text
     parts = text.split("---", 2)
@@ -63,11 +65,12 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
         meta = {}
     return meta, parts[2].strip()
 
-# Build skill registry at startup (used for safe lookup in load_skill)
+# 启动时的技能快照：完整文件留在 Harness 内存中，但不会因此进入模型上下文。
+# 运行中新增或修改 SKILL.md 后，需要重启才会被重新扫描。
 SKILL_REGISTRY: dict[str, dict] = {}
 
 def _scan_skills():
-    """Scan skills/ dir, populate SKILL_REGISTRY with name/description/content."""
+    """扫描每个技能目录的 SKILL.md，并以公开名称建立索引。"""
     if not SKILLS_DIR.exists():
         return
     for d in sorted(SKILLS_DIR.iterdir()):
@@ -75,23 +78,27 @@ def _scan_skills():
             continue
         manifest = d / "SKILL.md"
         if manifest.exists():
+            # 此处读取完整文档只是为了缓存；不是一次模型上下文注入。
             raw = manifest.read_text()
             meta, body = _parse_frontmatter(raw)
+            # frontmatter 可覆盖目录名和默认描述，供模型在目录中选择技能。
             name = meta.get("name", d.name)
             desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
+            # registry 的 key 是 load_skill 唯一接受的标识；模型不能传任意路径。
+            # content 在真正调用 load_skill 前都不发送给模型。
             SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": raw}
 
 _scan_skills()
 
 def list_skills() -> str:
-    """List all skills (name + one-line description)."""
+    """只生成 name + description 目录，不包含完整 SKILL.md。"""
     if not SKILL_REGISTRY:
         return "(no skills found)"
     return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
 
-# s07: SYSTEM includes skill catalog (cheap — just names + descriptions)
+# 每一轮都让模型看见“有哪些技能”，但把详细内容延迟到它明确请求时。
 def build_system() -> str:
-    """Build SYSTEM prompt with skill catalog injected at startup."""
+    """把轻量技能目录拼入 system prompt。"""
     catalog = list_skills()
     return (
         f"You are a coding agent at {WORKDIR}. "
@@ -101,7 +108,8 @@ def build_system() -> str:
 
 SYSTEM = build_system()
 
-# s07: subagent gets its own system prompt — no skill loading, no task
+# Teaching simplification: subagents receive neither load_skill nor task, so
+# the parent explicitly decides which knowledge and delegation are needed.
 SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
     "Complete the task you were given, then return a concise summary. "
@@ -267,10 +275,12 @@ def spawn_subagent(description: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 def load_skill(name: str) -> str:
-    """Load full skill content. Lookup via registry — no path traversal."""
+    """根据名称返回完整 SKILL.md，不接受调用方提供的文件路径。"""
+    # 只从启动时发现的 registry 取值，避免路径穿越，也明确工具可访问的范围。
     skill = SKILL_REGISTRY.get(name)
     if not skill:
         return f"Skill not found: {name}"
+    # 返回值成为当前轮的 tool_result，因此完整知识只从这里进入模型上下文。
     return skill["content"]
 
 
@@ -293,7 +303,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
     {"name": "task", "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
      "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
-    # s07: skill tool (catalog is already in SYSTEM prompt, this loads full content)
+    # SYSTEM 中已有轻量目录；此工具才是把某项完整技能注入当前上下文的边界。
     {"name": "load_skill", "description": "Load the full content of a skill by name.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
 ]
