@@ -108,6 +108,25 @@ def assert_no_orphan_tool_results(testcase, messages):
 
 
 class CompactionToolPairTests(unittest.TestCase):
+    def test_s08_reads_utf8_files_independent_of_system_encoding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module("s08_utf8_read_under_test", MODULES["s08"], Path(tmp))
+            expected = "中文 README — compact"
+            (module.WORKDIR / "utf8.md").write_bytes(expected.encode("utf-8"))
+            self.assertEqual(module.run_read("utf8.md"), expected)
+
+    def test_s08_decodes_utf8_subprocess_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_module("s08_utf8_bash_under_test", MODULES["s08"], Path(tmp))
+            expected = "子进程输出 — compact"
+            command = (
+                f'"{sys.executable}" -c '
+                f'"import sys;sys.stdout.buffer.write(bytes.fromhex('
+                f"'{expected.encode('utf-8').hex()}'"
+                f'))"'
+            )
+            self.assertEqual(module.run_bash(command), expected)
+
     def test_snip_compact_keeps_head_tool_pair(self):
         messages = [
             user_text(),
